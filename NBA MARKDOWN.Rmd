@@ -1,0 +1,225 @@
+---
+title: "NBA 25 ANALYSIS"
+author: "Yarden Safran"
+date: "2025-10-19"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(forcats)
+library(scales)
+library(tidyr)
+install.packages("ggrepel")
+```
+
+## R Markdown
+
+
+
+```{r csv}
+players <- read_csv("sportsref_download.csv")
+view(players)
+```
+
+## Including Plots
+
+The FANTASY INDEX GRAPHS
+
+```{r pressure, echo=FALSE}
+
+
+mode <- "NEW_TEAM"   # אפשר "TOT" או "NEW_TEAM"
+
+# --- ניקוי שמות + טיפול בקידוד ---
+players0 <- players %>%
+  mutate(
+    Player = stri_trans_general(Player, "Latin-ASCII"),
+    Player = gsub("[^A-Za-z ]", "", Player)
+  )
+
+if (mode == "TOT") {
+  # ===== גישה 1: לשמור רק את השורה המאוחדת (TOT/2TM) אם קיימת, אחרת שורה יחידה =====
+  players_one_row <- players0 %>%
+    group_by(Player) %>%
+    # אם קיימת שורת TOT/2TM – לקחת אותה; אחרת לקחת כל מה שיש (לרוב שורה בודדת)
+    arrange(desc(Team %in% c("TOT","2TM"))) %>%
+    slice(1) %>%
+    ungroup()
+
+} else if (mode == "NEW_TEAM") {
+  # ===== גישה 2: לשמור את "הקבוצה החדשה" (השהות הקצרה יותר) =====
+  # הסר שורות TOT/2TM
+  players_no_tot <- players0 %>% filter(!Team %in% c("TOT","2TM"))
+
+  # ברירת מחדל: בחר לכל שחקן את השורה עם הכי מעט משחקים (G) – בד"כ זו אחרי הטרייד
+  players_one_row <- players_no_tot %>%
+    group_by(Player) %>%
+    slice_min(G, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  # --- Optional: Overrides ידניים אם תרצה להכריע מפורשות ---
+  # דוגמה: אם תרצה לקבע ש"James Harden" = "LAC", "Damian Lillard" = "MIL"
+  latest_team_map <- c(
+    # "James Harden" = "LAC",
+    # "Damian Lillard" = "MIL"
+  )
+
+  if (length(latest_team_map) > 0) {
+    manual_rows <- players_no_tot %>%
+      semi_join(
+        tibble(Player = names(latest_team_map), Team = unname(latest_team_map)),
+        by = c("Player","Team")
+      )
+    # נחליף עבור השחקנים שיש להם override
+    players_one_row <- players_one_row %>%
+      filter(!Player %in% names(latest_team_map)) %>%
+      bind_rows(manual_rows)
+  }
+}
+
+# שחקנים ששיחקו מעל 15 דק בלבד
+players_clean <- players_one_row %>%
+  filter(!is.na(MP), MP > 15,G>25)
+
+# === חישובי per-36 ===
+players_36 <- players_clean %>%
+  mutate(
+    PTS_36 = PTS * (36 / MP),
+    TRB_36 = TRB * (36 / MP),
+    AST_36 = AST * (36 / MP),
+    STL_36 = STL * (36 / MP),
+    BLK_36 = BLK * (36 / MP),
+    TOV_36 = TOV * (36 / MP),
+    FG3_36 = `3P` * (36 / MP),
+    FGA_36 = FGA * (36 / MP),
+    FG_36  = FG  * (36 / MP),
+    FT_36  = FT  * (36 / MP)
+  ) %>%
+  mutate(
+    FantasyIndex = PTS_36*1 + TRB_36*1.2 + AST_36*2 + STL_36*4 + FG3_36*2 + BLK_36*4 - TOV_36*2 +
+                   (`FG%` * 2) + (`FT%` * 1.5)
+  )
+
+# דוגמה: דירוג + שני גרפים (1–30, 31–60) אחרי הסרת כפילויות
+ranked <- players_36 %>% arrange(desc(FantasyIndex)) %>% mutate(Rank = row_number())
+top_1_30  <- ranked %>% filter(Rank <= 30)
+top_31_60 <- ranked %>% filter(Rank > 30, Rank <= 60)
+
+plot_fantasy <- function(df, title_suffix){
+  ggplot(df, aes(x = reorder(Player, FantasyIndex), y = FantasyIndex, fill = Pos)) +
+    geom_col(width = 0.65, color = "white") +
+    coord_flip() +
+    scale_y_continuous(labels = scales::comma) +
+    labs(title = paste0("NBA Fantasy Index per 36 – ", title_suffix),
+       
+         x = "", y = "Fantasy Score per 36", fill = "Position") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.y = element_text(size = 9.5, lineheight = 1.25),
+          plot.title = element_text(face = "bold"))
+}
+
+plot_fantasy(top_1_30,  "Ranks 1–30")
+plot_fantasy(top_31_60, "Ranks 31–60")
+
+
+
+```
+
+
+```{r index per position}
+
+
+# === חישוב ממוצע לכל עמדה ===
+pos_baseline <- players_36 %>%
+  group_by(Pos) %>%
+  summarise(
+    PosMean = mean(FantasyIndex, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# === חיבור הממוצע לעובדים עצמם ===
+players_by_role <- players_36 %>%
+  left_join(pos_baseline, by = "Pos")
+
+# === בחירת טופ 10 לכל עמדה ===
+top_by_role <- players_by_role %>%
+  group_by(Pos) %>%
+  slice_max(FantasyIndex, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+# === גרף נקי עם קו ממוצע לכל עמדה ===
+ggplot(top_by_role,
+       aes(x = fct_reorder(Player, FantasyIndex),
+           y = FantasyIndex, fill = Pos)) +
+  geom_col(width = 0.65, color = "white") +
+  geom_hline(aes(yintercept = PosMean),
+             color = "red", linetype = "dashed", linewidth = 0.8) +
+  coord_flip() +
+  facet_wrap(~ Pos, scales = "free_y") +
+  labs(
+    title = "NBA Fantasy Index per 36 – לפי עמדה",
+    x = "", y = "Fantasy Score per 36",
+    fill = "Position"
+  ) +
+  theme_minimal(base_size = 13) +
+  scale_y_continuous(labels = comma) +
+  theme(
+    axis.text.y = element_text(size = 9.5, lineheight = 1.2),
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "none"
+  )
+pos_summary <- players_36 %>%
+  group_by(Pos) %>%
+  summarise(
+    Mean_FantasyIndex = round(mean(FantasyIndex, na.rm = TRUE), 2),
+    Median_FantasyIndex = round(median(FantasyIndex, na.rm = TRUE), 2),
+    SD_FantasyIndex = round(sd(FantasyIndex, na.rm = TRUE), 2),
+    Count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Mean_FantasyIndex))
+
+# הצגת טבלה מסודרת
+pos_summary
+
+
+```
+
+```{r DeniStats}
+library(dplyr)
+library(stringr)
+
+# 1) שורה/ות של דני מתוך players_36
+deni <- players_36 %>%
+  filter(str_detect(Player, regex("^Deni\\s+Avdija$", ignore_case = TRUE))) %>%
+  select(Player, Team, Pos, G, MP, FantasyIndex)
+
+
+# מצרף ממוצע עמדה ומחשב פער ואחוזון בתוך העמדה
+deni_ctx <- deni %>%
+  left_join(pos_baseline, by = "Pos") %>%
+  mutate(OverPosition = round(FantasyIndex - PosMean, 2))
+
+# אחוזון של דני בתוך העמדה (0–100)
+deni_pct <- players_36 %>%
+  group_by(Pos) %>%
+  mutate(pct = 100 * percent_rank(FantasyIndex)) %>%
+  ungroup() %>%
+  filter(str_detect(Player, regex("^Deni\\s+Avdija$", ignore_case = TRUE))) %>%
+  select(Player, Pos, FantasyIndex, pct)
+
+deni_ctx
+deni_pct
+
+```
+
+
+
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
